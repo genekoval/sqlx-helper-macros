@@ -5,8 +5,8 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
-    Generics, Ident, ImplItem, ImplItemFn, Item, ItemImpl, Pat, PatType,
-    Result, ReturnType, Stmt, Token, Type,
+    Expr, Generics, Ident, ImplItem, ImplItemFn, Item, ItemImpl, Pat, PatType,
+    Receiver, Result, ReturnType, Stmt, Token, Type,
 };
 
 struct SqlFn {
@@ -55,7 +55,7 @@ impl Parse for Database {
     }
 }
 
-fn make_fn(sql_fn: SqlFn) -> ImplItemFn {
+fn make_fn(sql_fn: SqlFn, is_mut: bool, executor: &Expr) -> ImplItemFn {
     let name = &sql_fn.name;
     let generics = &sql_fn.generics;
     let args = &sql_fn.args;
@@ -67,12 +67,20 @@ fn make_fn(sql_fn: SqlFn) -> ImplItemFn {
     };
 
     let result: Type = match return_type {
-        Some(ref ty) => parse_quote! { Result<#ty, sqlx::Error> },
-        None => parse_quote! { Result<(), sqlx::Error> },
+        Some(ref ty) => parse_quote! {
+            ::core::result::Result<#ty, ::sqlx::Error>
+        },
+        None => parse_quote! { ::core::result::Result<(), ::sqlx::Error> },
+    };
+
+    let receiver: Receiver = if is_mut {
+        parse_quote! { &mut self }
+    } else {
+        parse_quote! { &self }
     };
 
     let mut function: ImplItemFn = parse_quote! {
-        pub async fn #name #generics(&self, #args) -> #result {}
+        pub async fn #name #generics(#receiver, #args) -> #result {}
     };
 
     let mut query_string = format!("SELECT * FROM {}(", sql_fn.name);
@@ -142,14 +150,14 @@ fn make_fn(sql_fn: SqlFn) -> ImplItemFn {
         Some(_) => {
             stmts.push(Stmt::Expr(
                 parse_quote! {
-                    query.#fetch(&self.pool).await
+                    query.#fetch(#executor).await
                 },
                 None,
             ));
         }
         None => {
             stmts.push(parse_quote! {
-                let _ = query.#fetch(&self.pool).await?;
+                let _ = query.#fetch(#executor).await?;
             });
             stmts.push(Stmt::Expr(
                 parse_quote! {
@@ -174,17 +182,66 @@ pub fn database(input: TokenStream) -> TokenStream {
     });
 
     let mut imp: ItemImpl = parse_quote! {
-        impl Database {}
+        impl Database {
+            pub fn new(pool: ::sqlx::postgres::PgPool) -> Database {
+                Database { pool }
+            }
+            pub async fn begin(&self) -> ::core::result::Result<
+                Transaction,
+                ::sqlx::Error
+            > {
+                Ok(Transaction {
+                    transaction: self.pool.begin().await? })
+            }
+        }
     };
 
-    imp.items.push(ImplItem::Fn(parse_quote! {
-        pub fn new(pool: ::sqlx::postgres::PgPool) -> Database {
-            Database { pool }
-        }
-    }));
+    let executor: Expr = parse_quote! { &self.pool };
 
     for function in db.functions {
-        imp.items.push(ImplItem::Fn(make_fn(function)));
+        imp.items
+            .push(ImplItem::Fn(make_fn(function, false, &executor)));
+    }
+
+    let output = quote! {
+        #decl
+        #imp
+    };
+
+    output.into()
+}
+
+#[proc_macro]
+pub fn transaction(input: TokenStream) -> TokenStream {
+    let tx = parse_macro_input!(input as Database);
+
+    let decl: Item = Item::Struct(parse_quote! {
+        pub struct Transaction {
+            transaction:
+                ::sqlx::Transaction<'static, ::sqlx::postgres::Postgres>,
+        }
+    });
+
+    let mut imp: ItemImpl = parse_quote! {
+        impl Transaction {
+            pub async fn commit(self) ->
+                ::core::result::Result<(), ::sqlx::Error>
+            {
+                self.transaction.commit().await
+            }
+            pub async fn rollback(self) ->
+                ::core::result::Result<(), ::sqlx::Error>
+            {
+                self.transaction.rollback().await
+            }
+        }
+    };
+
+    let executor: Expr = parse_quote! { &mut *self.transaction };
+
+    for function in tx.functions {
+        imp.items
+            .push(ImplItem::Fn(make_fn(function, true, &executor)))
     }
 
     let output = quote! {
