@@ -183,15 +183,12 @@ pub fn database(input: TokenStream) -> TokenStream {
 
     let mut imp: ItemImpl = parse_quote! {
         impl Database {
-            pub fn new(pool: ::sqlx::postgres::PgPool) -> Database {
-                Database { pool }
+            pub fn new(pool: ::sqlx::postgres::PgPool) -> Self {
+                Self { pool }
             }
-            pub async fn begin(&self) -> ::core::result::Result<
-                Transaction,
-                ::sqlx::Error
-            > {
-                Ok(Transaction {
-                    transaction: self.pool.begin().await? })
+
+            pub async fn close(&self) {
+                self.pool.close().await
             }
         }
     };
@@ -222,6 +219,19 @@ pub fn transaction(input: TokenStream) -> TokenStream {
         }
     });
 
+    let begin: ItemImpl = parse_quote! {
+        impl Database {
+            pub async fn begin(&self) -> ::core::result::Result<
+                Transaction,
+                ::sqlx::Error
+            > {
+                Ok(Transaction {
+                    transaction: self.pool.begin().await? })
+            }
+
+        }
+    };
+
     let mut imp: ItemImpl = parse_quote! {
         impl Transaction {
             pub async fn commit(self) ->
@@ -229,6 +239,7 @@ pub fn transaction(input: TokenStream) -> TokenStream {
             {
                 self.transaction.commit().await
             }
+
             pub async fn rollback(self) ->
                 ::core::result::Result<(), ::sqlx::Error>
             {
@@ -246,6 +257,7 @@ pub fn transaction(input: TokenStream) -> TokenStream {
 
     let output = quote! {
         #decl
+        #begin
         #imp
     };
 
