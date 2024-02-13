@@ -5,8 +5,9 @@ use syn::{
     parse::{Parse, ParseStream},
     parse_macro_input, parse_quote,
     punctuated::Punctuated,
-    Expr, Generics, Ident, ImplItem, ImplItemFn, Item, ItemImpl, Pat, PatType,
-    Receiver, Result, ReturnType, Stmt, Token, Type,
+    Expr, GenericArgument, Generics, Ident, ImplItem, ImplItemFn, Item,
+    ItemImpl, Pat, PatType, PathArguments, Receiver, Result, ReturnType, Stmt,
+    Token, Type,
 };
 
 struct SqlFn {
@@ -56,21 +57,61 @@ impl Parse for Database {
 }
 
 fn make_fn(sql_fn: SqlFn, is_mut: bool, executor: &Expr) -> ImplItemFn {
+    enum ReturnTypeVariant {
+        Default,
+        Stream,
+        Vec,
+        Option,
+        Other,
+    }
+
     let name = &sql_fn.name;
     let generics = &sql_fn.generics;
     let args = &sql_fn.args;
-    let return_type: Option<Box<Type>> = {
-        match sql_fn.output {
-            ReturnType::Default => None,
-            ReturnType::Type(_, ty) => Some(ty.clone()),
+    let (rt_variant, rt_type): (ReturnTypeVariant, Option<&Type>) = {
+        match &sql_fn.output {
+            ReturnType::Default => (ReturnTypeVariant::Default, None),
+            ReturnType::Type(_, ty) => match ty.as_ref() {
+                Type::Path(type_path) => {
+                    let segment = type_path.path.segments.first().unwrap();
+
+                    match segment.ident.to_string().as_str() {
+                        "BoxStream" => {
+                            let PathArguments::AngleBracketed(arguments) =
+                                &segment.arguments
+                            else {
+                                panic!("Expected angle bracketed arguments");
+                            };
+
+                            let GenericArgument::Type(ty) =
+                                arguments.args.first().unwrap()
+                            else {
+                                panic!("Expected a type");
+                            };
+
+                            (ReturnTypeVariant::Stream, Some(ty))
+                        }
+                        "Vec" => (ReturnTypeVariant::Vec, Some(ty)),
+                        "Option" => (ReturnTypeVariant::Option, Some(ty)),
+                        _ => (ReturnTypeVariant::Other, Some(ty)),
+                    }
+                }
+                _ => (ReturnTypeVariant::Other, Some(ty)),
+            },
         }
     };
 
-    let result: Type = match return_type {
-        Some(ref ty) => parse_quote! {
+    let result: Type = match (&rt_variant, rt_type) {
+        (ReturnTypeVariant::Default, None) => parse_quote! {
+            ::core::result::Result<(), ::sqlx::Error>
+        },
+        (ReturnTypeVariant::Stream, Some(ty)) => parse_quote! {
+            BoxStream<::core::result::Result<#ty, ::sqlx::Error>>
+        },
+        (_, Some(ty)) => parse_quote! {
             ::core::result::Result<#ty, ::sqlx::Error>
         },
-        None => parse_quote! { ::core::result::Result<(), ::sqlx::Error> },
+        (_, _) => unreachable!(),
     };
 
     let receiver: Receiver = if is_mut {
@@ -83,6 +124,10 @@ fn make_fn(sql_fn: SqlFn, is_mut: bool, executor: &Expr) -> ImplItemFn {
         pub async fn #name #generics(#receiver, #args) -> #result {}
     };
 
+    if let ReturnTypeVariant::Stream = &rt_variant {
+        function.sig.asyncness = None;
+    }
+
     let mut query_string = format!("SELECT * FROM {}(", sql_fn.name);
     for i in 1..=sql_fn.args.len() {
         query_string.push_str(&format!("${}", i));
@@ -94,9 +139,9 @@ fn make_fn(sql_fn: SqlFn, is_mut: bool, executor: &Expr) -> ImplItemFn {
     query_string.push(')');
 
     let query: Ident = {
-        let query = match return_type {
-            Some(_) => "query_as",
-            None => "query",
+        let query = match rt_variant {
+            ReturnTypeVariant::Default => "query",
+            _ => "query_as",
         };
 
         Ident::new(query, proc_macro2::Span::call_site())
@@ -120,44 +165,34 @@ fn make_fn(sql_fn: SqlFn, is_mut: bool, executor: &Expr) -> ImplItemFn {
         });
     }
 
-    let fetch = {
-        let fetch = match return_type {
-            Some(ref ty) => match ty.as_ref() {
-                Type::Path(path) => {
-                    let segments = &path.path.segments;
-                    let segstring = quote!(#segments).to_string();
-                    let key = match segstring.find(' ') {
-                        Some(i) => &segstring[..i],
-                        None => &segstring,
-                    };
-                    match key {
-                        "Option" => "fetch_optional",
-                        "std::option::Option" => "fetch_optional",
-                        "Vec" => "fetch_all",
-                        "std::vec::Vec" => "fetch_all",
-                        _ => "fetch_one",
-                    }
-                }
-                _ => "fetch_one",
+    match rt_variant {
+        ReturnTypeVariant::Option => stmts.push(Stmt::Expr(
+            parse_quote! {
+                query.fetch_optional(#executor).await
             },
-            None => "execute",
-        };
-
-        Ident::new(fetch, proc_macro2::Span::call_site())
-    };
-
-    match return_type {
-        Some(_) => {
-            stmts.push(Stmt::Expr(
-                parse_quote! {
-                    query.#fetch(#executor).await
-                },
-                None,
-            ));
-        }
-        None => {
+            None,
+        )),
+        ReturnTypeVariant::Vec => stmts.push(Stmt::Expr(
+            parse_quote! {
+                query.fetch_all(#executor).await
+            },
+            None,
+        )),
+        ReturnTypeVariant::Stream => stmts.push(Stmt::Expr(
+            parse_quote! {
+                query.fetch(#executor)
+            },
+            None,
+        )),
+        ReturnTypeVariant::Other => stmts.push(Stmt::Expr(
+            parse_quote! {
+                query.fetch_one(#executor).await
+            },
+            None,
+        )),
+        ReturnTypeVariant::Default => {
             stmts.push(parse_quote! {
-                let _ = query.#fetch(#executor).await?;
+                let _ = query.execute(#executor).await?;
             });
             stmts.push(Stmt::Expr(
                 parse_quote! {
